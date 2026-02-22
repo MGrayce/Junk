@@ -1,0 +1,726 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using UG_DT_DeepLenz.models;
+
+namespace UG_DT_DeepLenz.parsers
+{
+
+    public sealed class GenericStatementParser : IBankValueDateParser
+    {
+        public string Bank => _activeProfile?.BankName ?? "Generic (Auto)";
+        public bool Diagnostics { get; set; } = true;
+
+        private readonly Profile? _forcedProfile;
+        private Profile? _activeProfile;
+
+        public GenericStatementParser(Profile? forced = null) { _forcedProfile = forced; }
+        public GenericStatementParser() : this(null) { }
+
+        private void Log(string msg) { if (Diagnostics) Console.WriteLine(msg); }
+
+        public bool CanHandle(string rawText)
+        {
+            if (string.IsNullOrWhiteSpace(rawText)) return false;
+            var p = _forcedProfile ?? DetectProfile(rawText) ?? Profiles.Default();
+            return p.DateAnyRx.IsMatch(rawText ?? "");
+        }
+
+        public IEnumerable<ValueDateTxn> Parse(string rawText)
+        {
+            var outRows = new List<ValueDateTxn>();
+            if (string.IsNullOrWhiteSpace(rawText))
+            {
+                Log("[Diag] Input empty.");
+                return outRows;
+            }
+
+            // ---- Choose profile
+            var p = _forcedProfile ?? DetectProfile(rawText) ?? Profiles.Default();
+            _activeProfile = p;
+
+            // ---- Normalize text
+            var normalized = Normalize(rawText);
+            var linesAll = normalized.Split('\n').Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
+
+            // ---- Soft-cut boilerplate lines (keep those that also contain dates or money)
+            var lines = new List<string>(linesAll.Count);
+            foreach (var l in linesAll)
+            {
+                if (ShouldDropLine(l, p))
+                {
+                    // Keep if line also has a date or money – might contain a legitimate row
+                    if (!(p.DateAnyRx.IsMatch(l) || LineHasMoney(l, p)))
+                        continue;
+                }
+                lines.Add(l);
+            }
+
+            Log($"[Diag] Profile: {p.BankName}");
+            Log($"[Diag] Lines kept: {lines.Count} (from {linesAll.Count})");
+
+            // ---- Stitch lines into blobs (each blob begins when a new date appears)
+            var blobs = Stitch(lines, p);
+            Log($"[Diag] Blobs: {blobs.Count}");
+
+            if (blobs.Count == 0) return outRows;
+
+            // ---- Split blobs into candidate rows at date boundaries
+            var rowCandidates = blobs.SelectMany(b => SplitRowsByAnyDate(b, p)).ToList();
+            Log($"[Diag] Row candidates: {rowCandidates.Count}");
+
+            // ---- Parse rows (balance-first)
+            int droppedNoDates = 0, droppedNoBalance = 0;
+            foreach (var rc in rowCandidates)
+            {
+                var row = ParseRow(rc, p, out bool noDates, out bool noBalance);
+                if (row == null)
+                {
+                    if (noDates) droppedNoDates++;
+                    if (noBalance) droppedNoBalance++;
+                    continue;
+                }
+
+                outRows.Add(new ValueDateTxn
+                {
+                    TransactionDate = row.TranDate,
+                    ValueDate = row.ValueDate,
+                    Description = row.Description,
+                    Debit = null,   // computed later
+                    Credit = null,  // computed later
+                    Balance = row.Balance
+                });
+            }
+
+            Log($"[Diag] Parsed rows (pre-D/C): {outRows.Count}, droppedNoDates:{droppedNoDates}, droppedNoBalance:{droppedNoBalance}");
+
+            // ---- Enforce: rows must have at least one date
+            outRows = outRows.Where(r => r.TransactionDate.HasValue || r.ValueDate.HasValue).ToList();
+
+            // ---- Compute Debits/Credits from balance deltas
+            outRows = ComputeDebitsCreditsFromBalance(outRows);
+
+            if (outRows.Count > 0)
+            {
+                var f = outRows[0]; var l = outRows[^1];
+                Log($"[Diag] First: {f.TransactionDate:dd/MM/yyyy} {f.ValueDate:dd/MM/yyyy} | {f.Description} | D:{f.Debit} C:{f.Credit} Bal:{f.Balance}");
+                Log($"[Diag] Last : {l.TransactionDate:dd/MM/yyyy} {l.ValueDate:dd/MM/yyyy} | {l.Description} | D:{l.Debit} C:{l.Credit} Bal:{l.Balance}");
+            }
+
+            return outRows;
+        }
+
+        // ----------------- Row model -----------------
+
+        private sealed class ParsedRow
+        {
+            public DateTime? TranDate { get; init; }
+            public DateTime? ValueDate { get; init; }
+            public string Description { get; init; } = "";
+            public decimal Balance { get; init; }
+        }
+
+        // ----------------- Parsing logic -----------------
+
+        private static ParsedRow? ParseRow(string s, Profile p, out bool droppedNoDates, out bool droppedNoBalance)
+        {
+            droppedNoDates = droppedNoBalance = false;
+            if (string.IsNullOrWhiteSpace(s)) { droppedNoDates = true; return null; }
+
+            // Trim any trailing non-row markers and keep up to last money-like token
+            s = TruncateAfterFinalMoney(s, p);
+
+            // Tokenize
+            var tokens = Split(s);
+            if (tokens.Count == 0) { droppedNoDates = true; return null; }
+
+            // Find first and optional second date ANYWHERE in the tokens
+            if (!TryFindDatesAnywhere(tokens, p, out var tDate, out var vDate, out var firstNonDateIdx))
+            {
+                droppedNoDates = true;
+                return null;
+            }
+
+            // Find rightmost money (Balance). Accept CR/DR suffixes and split CR/DR tokens.
+            if (!TryFindRightmostBalance(tokens, p, out var balIndex, out var balance))
+            {
+                droppedNoBalance = true;
+                return null;
+            }
+
+            // Description: tokens between (last date token) and the balance token
+            var descTokens = tokens.Skip(firstNonDateIdx).Take(Math.Max(0, balIndex - firstNonDateIdx)).ToList();
+
+            // Many layouts have the transaction amount just before balance; drop one trailing money token if present
+            if (descTokens.Count > 0 && LooksLikeMoney(descTokens[^1], p))
+                descTokens.RemoveAt(descTokens.Count - 1);
+
+            var desc = string.Join(" ", descTokens).Trim();
+
+            // Ensure at least one date present
+            var txn = tDate ?? vDate;
+            var val = vDate ?? tDate;
+            if (!txn.HasValue && !val.HasValue) { droppedNoDates = true; return null; }
+
+            return new ParsedRow
+            {
+                TranDate = txn,
+                ValueDate = val,
+                Description = desc,
+                Balance = balance
+            };
+        }
+
+        // ----------------- Post-pass D/C from balance deltas -----------------
+
+        private List<ValueDateTxn> ComputeDebitsCreditsFromBalance(List<ValueDateTxn> rows)
+        {
+            if (rows.Count == 0) return rows;
+
+            decimal? baseline = null;
+
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                bool hasDate = r.TransactionDate.HasValue || r.ValueDate.HasValue;
+
+                // Skip D/C if no date (but advance baseline)
+                if (!hasDate)
+                {
+                    if (Diagnostics)
+                        Log($"[Diag/Diff] Row {i}: NO DATE → D/C=null; baseline={r.Balance:N2}");
+                    r.Debit = null; r.Credit = null; baseline = r.Balance; continue;
+                }
+
+                // Skip D/C for ignored descriptions (but advance baseline)
+                if (ContainsIgnoreMarker(r.Description))
+                {
+                    if (Diagnostics)
+                        Log($"[Diag/Diff] Row {i}: IGNORE ('{r.Description}') → D/C=null; baseline={r.Balance:N2}");
+                    r.Debit = null; r.Credit = null; baseline = r.Balance; continue;
+                }
+
+                if (!baseline.HasValue)
+                {
+                    if (Diagnostics)
+                        Log($"[Diag/Diff] Row {i}: FIRST usable → D/C=null; baseline={r.Balance:N2}");
+                    r.Debit = null; r.Credit = null; baseline = r.Balance; continue;
+                }
+
+                var delta = r.Balance - baseline.Value;
+                var abs = Math.Abs((decimal)delta);
+
+                r.Debit = delta < 0 ? abs : (decimal?)null;
+                r.Credit = delta > 0 ? abs : (decimal?)null;
+
+                if (Diagnostics)
+                {
+                    var kind = delta < 0 ? $"DEBIT {abs:N2}" : delta > 0 ? $"CREDIT {abs:N2}" : "NO-CHANGE";
+                    Log($"[Diag/Diff] Row {i}: prev={baseline.Value:N2} -> curr={r.Balance:N2} Δ={delta:N2} → {kind} | '{r.Description}'");
+                }
+
+                baseline = r.Balance;
+            }
+
+            return rows;
+        }
+
+        // ----------------- Stitch / Split -----------------
+
+        private static List<string> Stitch(List<string> lines, Profile p)
+        {
+            var output = new List<string>();
+            var buf = new StringBuilder();
+
+            bool StartsRow(string ln) => p.DateAnyRx.IsMatch(ln);
+
+            foreach (var l in lines.Select(x => TruncateAfterFinalMoney(x, p)))
+            {
+                if (StartsRow(l))
+                {
+                    if (buf.Length > 0)
+                    {
+                        output.Add(buf.ToString().Trim());
+                        buf.Clear();
+                    }
+                    buf.Append(l);
+                }
+                else if (buf.Length > 0)
+                {
+                    buf.Append(' ').Append(l);
+                }
+            }
+
+            if (buf.Length > 0) output.Add(buf.ToString().Trim());
+            return output;
+        }
+
+        private static IEnumerable<string> SplitRowsByAnyDate(string blob, Profile p)
+        {
+            if (string.IsNullOrWhiteSpace(blob)) yield break;
+
+            var parts = p.RowSplitAnyDateRx.Split(blob);
+            foreach (var part in parts)
+            {
+                var s = (part ?? "").Trim();
+                if (s.Length > 0) yield return s;
+            }
+        }
+
+        // ----------------- Normalization & Filters -----------------
+
+        private static string Normalize(string t)
+        {
+            if (string.IsNullOrWhiteSpace(t)) return t;
+
+            t = t.Replace("\r", "\n").Replace("\u00A0", " "); // NBSP → space
+
+            // Unicode dashes → ASCII '-'
+            t = t.Replace("\u2010", "-").Replace("\u2011", "-")
+                 .Replace("\u2012", "-").Replace("\u2013", "-")
+                 .Replace("\u2014", "-").Replace("\u2212", "-");
+
+            // Strip Unicode format/invisible chars
+            t = Regex.Replace(t, @"\p{Cf}", "");
+
+            // Standardize whitespace a bit (keep \n for line logic)
+            t = Regex.Replace(t, @"[ \t]+", " ");
+            t = Regex.Replace(t, @"\n{2,}", "\n");
+
+            return t.Trim();
+        }
+
+        private static bool ShouldDropLine(string l, Profile p)
+        {
+            // If line contains explicit cut markers and does NOT contain dates or money, drop it
+            // (We check dates/money outside to decide keeping)
+            foreach (var m in p.CutMarkers)
+            {
+                if (l.IndexOf(m, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+            return false;
+        }
+
+        private static string TruncateAfterFinalMoney(string line, Profile p)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return line;
+
+            if (p.PageCounterTailRx != null)
+                line = p.PageCounterTailRx.Replace(line, "");
+
+            if (p.GluedHeadersTailRx != null)
+                line = p.GluedHeadersTailRx.Replace(line, "");
+
+            var tokens = Split(line);
+            for (int i = tokens.Count - 1; i >= 0; i--)
+            {
+                var tok = tokens[i];
+                bool moneyHere = LooksLikeMoney(tok, p)
+                                 || (i - 1 >= 0 && IsCrDr(tok) && LooksLikeMoney(tokens[i - 1], p))
+                                 || MoneyZeroRx.IsMatch(tok)
+                                 || PlainIntRx.IsMatch(tok);
+                if (moneyHere)
+                    return string.Join(" ", tokens.Take(i + 1));
+            }
+            return line;
+        }
+
+        // Returns true if the line contains something that looks like a money token.
+        // We accept core money (with UGX prefix/suffix, commas, decimals, parentheses)
+        // and also tolerate plain integers / zeros (common after aggressive OCR).
+        private static bool LineHasMoney(string line, Profile p)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return false;
+
+            foreach (var tok in Split(line))
+            {
+                if (LooksLikeMoney(tok, p))                  // e.g., "123,456.00", "(1,234)", "2,000CR"
+                    return true;
+
+                // Fallbacks: allow isolated "0"/"0.00" and smallish plain ints
+                if (MoneyZeroRx.IsMatch(tok) || PlainIntRx.IsMatch(tok))
+                    return true;
+            }
+            return false;
+        }
+
+
+        private static List<string> Split(string s)
+            => Regex.Split(s ?? "", @"\s+").Where(x => x.Length > 0).ToList();
+
+        // ----------------- Date & Money helpers -----------------
+
+        private static readonly CultureInfo CI = CultureInfo.GetCultureInfo("en-UG");
+
+        private static readonly string[] ExtraDateFormats =
+        {
+            "yyyy-MM-dd", "yyyy/MM/dd", "yyyy.MM.dd",
+            "dd.MM.yyyy", "d.M.yyyy", "dd.MM.yy", "d.M.yy",
+            "dd MMM yyyy", "d MMM yyyy",
+            "dd MMMM yyyy", "d MMMM yyyy",
+            "MM/dd/yyyy", "M/d/yyyy"
+        };
+
+        private static bool TryParseDateFlexible(string s, Profile p, out DateTime dt)
+        {
+            s = (s ?? "").Trim();
+            // Title-case month names like jan/JAN → Jan
+            s = Regex.Replace(s, @"([A-Za-z]{3,})",
+                 m => CultureInfo.InvariantCulture.TextInfo.ToTitleCase(m.Value.ToLowerInvariant()));
+
+            // Try profile formats
+            if (DateTime.TryParseExact(s, p.DateFormats, CI,
+                    DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeLocal, out dt))
+                return true;
+
+            // Try extras
+            if (DateTime.TryParseExact(s, ExtraDateFormats, CI,
+                    DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeLocal, out dt))
+                return true;
+
+            // Last resort
+            return DateTime.TryParse(s, CI, DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeLocal, out dt);
+        }
+
+        private static bool TryFindDatesAnywhere(
+            List<string> tokens, Profile p,
+            out DateTime? tran, out DateTime? value, out int firstNonDateIdx)
+        {
+            tran = null; value = null; firstNonDateIdx = 0;
+            var idxs = new List<int>();
+
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                var tok = tokens[i];
+                if (p.DateAnyRx.IsMatch(tok) && TryParseDateFlexible(tok, p, out var d))
+                {
+                    idxs.Add(i);
+                    if (idxs.Count == 2) break;
+                }
+            }
+
+            if (idxs.Count == 0) return false;
+
+            var i1 = idxs[0];
+            tran = TryParseDateFlexible(tokens[i1], p, out var d1) ? d1 : (DateTime?)null;
+
+            if (idxs.Count > 1)
+            {
+                var i2 = idxs[1];
+                value = TryParseDateFlexible(tokens[i2], p, out var d2) ? d2 : (DateTime?)null;
+                firstNonDateIdx = Math.Max(i1, i2) + 1;
+            }
+            else
+            {
+                value = tran;
+                firstNonDateIdx = i1 + 1;
+            }
+
+            return tran.HasValue || value.HasValue;
+        }
+
+        // Money recognition (supports parentheses and CR/DR suffixes)
+        private static readonly Regex CrDrSuffixRx = new(@"\s*(CR|DR)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex CrDrTokenRx = new(@"^(CR|DR)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static bool IsCrDr(string s) => CrDrTokenRx.IsMatch(s);
+
+        private static readonly Regex MoneyZeroRx = new(@"^\(?0+(?:\.0{1,2})?\)?$", RegexOptions.Compiled);
+        private static readonly Regex PlainIntRx = new(@"^\-?\(?\d{1,12}\)?$", RegexOptions.Compiled);
+
+        private static bool LooksLikeMoney(string s, Profile p)
+        {
+            s = (s ?? "").Trim();
+            s = p.UgxPreRx.Replace(s, "");
+            s = p.UgxSufRx.Replace(s, "");
+            if (p.DashRx.IsMatch(s)) return false;
+
+            // Allow trailing CR/DR by stripping for the core check
+            var core = CrDrSuffixRx.Replace(s, "");
+            return p.MoneyCoreRx.IsMatch(core);
+        }
+
+        private static decimal? ParseMoney(string s, Profile p)
+        {
+            s = (s ?? "").Trim();
+            s = p.UgxPreRx.Replace(s, "");
+            s = p.UgxSufRx.Replace(s, "");
+            if (p.DashRx.IsMatch(s)) return null;
+
+            // Detect trailing CR/DR sign before parentheses handling
+            string? crdr = null;
+            var m = CrDrSuffixRx.Match(s);
+            if (m.Success) crdr = m.Groups[1].Value.ToUpperInvariant();
+
+            var core = CrDrSuffixRx.Replace(s, "");
+            bool negByParens = core.StartsWith("(") && core.EndsWith(")");
+            core = core.Trim('(', ')').Replace(",", "");
+
+            if (!decimal.TryParse(core, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint,
+                                  CultureInfo.InvariantCulture, out var v))
+                return null;
+
+            // Apply CR/DR semantics (DR negative, CR positive)
+            if (crdr == "DR") v = -Math.Abs(v);
+            else if (crdr == "CR") v = Math.Abs(v);
+
+            if (negByParens) v = -Math.Abs(v);
+            return v;
+        }
+
+        private static bool TryParsePlainMoney(string s, out decimal v)
+        {
+            bool negByParens = s.StartsWith("(") && s.EndsWith(")");
+            var core = s.Trim('(', ')');
+            if (!decimal.TryParse(core, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint,
+                                  CultureInfo.InvariantCulture, out v))
+                return false;
+            if (negByParens) v = -Math.Abs(v);
+            return true;
+        }
+
+        private static bool TryFindRightmostBalance(List<string> tokens, Profile p, out int index, out decimal value)
+        {
+            // Pass 1: Money token (with optional inline CR/DR suffix)
+            for (int i = tokens.Count - 1; i >= 0; i--)
+            {
+                var tok = tokens[i];
+                if (LooksLikeMoney(tok, p))
+                {
+                    var v = ParseMoney(tok, p);
+                    if (v.HasValue) { index = i; value = v.Value; return true; }
+                }
+
+                // Pass 1b: [amount] [CR|DR] split across tokens
+                if (i - 1 >= 0 && IsCrDr(tok) && LooksLikeMoney(tokens[i - 1], p))
+                {
+                    var combined = tokens[i - 1] + tokens[i]; // "11,387,122" + "DR" => "11,387,122DR"
+                    var v2 = ParseMoney(combined, p);
+                    if (v2.HasValue) { index = i; value = v2.Value; return true; }
+                }
+            }
+
+            // Pass 2: zero fallback
+            for (int i = tokens.Count - 1; i >= 0; i--)
+            {
+                if (MoneyZeroRx.IsMatch(tokens[i]) && TryParsePlainMoney(tokens[i], out var v2))
+                {
+                    index = i; value = v2; return true;
+                }
+            }
+
+            // Pass 3: plain integer fallback (avoid long reference numbers)
+            for (int i = tokens.Count - 1; i >= 0; i--)
+            {
+                if (PlainIntRx.IsMatch(tokens[i]) && TryParsePlainMoney(tokens[i], out var v3))
+                {
+                    index = i; value = v3; return true;
+                }
+            }
+
+            index = -1; value = default;
+            return false;
+        }
+
+        // ----------------- Ignore markers -----------------
+
+        private static readonly string[] IgnoreDescMarkers =
+        {
+            "OPENING BALANCE",
+            "CLOSING BALANCE",
+            "B/F",
+            "BROUGHT FORWARD"
+        };
+
+        private static bool ContainsIgnoreMarker(string? desc)
+        {
+            if (string.IsNullOrWhiteSpace(desc)) return false;
+            var up = desc.ToUpperInvariant();
+            return IgnoreDescMarkers.Any(m => up.Contains(m));
+        }
+
+        // ----------------- Profile / Detection -----------------
+
+        private static Profile? DetectProfile(string text)
+        {
+            // Extend this if you want bank-specific cut markers / formats
+            if (text.IndexOf("STANBIC", StringComparison.OrdinalIgnoreCase) >= 0)
+                return Profiles.StanbicUg();
+            if (text.IndexOf("CENTENARY", StringComparison.OrdinalIgnoreCase) >= 0)
+                return Profiles.Centenary();
+            if (text.IndexOf("EQUITY", StringComparison.OrdinalIgnoreCase) >= 0)
+                return Profiles.Equity();
+            return null;
+        }
+
+        public sealed class Profile
+        {
+            public string BankName { get; init; } = "Generic (Auto)";
+            public string[] DateFormats { get; init; } = Array.Empty<string>();
+            public MoneySettings Money { get; init; } = new();
+
+            public string[] CutMarkers { get; init; } = Array.Empty<string>();
+            public Regex? PageCounterTailRx { get; init; }
+            public Regex? GluedHeadersTailRx { get; init; }
+
+            // Compiled helpers
+            public Regex DateAnyRx { get; init; } = null!;
+            public Regex RowSplitAnyDateRx { get; init; } = null!;
+            public Regex MoneyCoreRx { get; init; } = null!;
+            public Regex DashRx { get; init; } = new(@"^[-–—]$", RegexOptions.Compiled);
+            public Regex UgxPreRx { get; init; } = new(@"^\s*(UGX|Ugx|ugx)\s*", RegexOptions.Compiled);
+            public Regex UgxSufRx { get; init; } = new(@"\s*(UGX|Ugx|ugx)\s*$", RegexOptions.Compiled);
+        }
+
+        public sealed class MoneySettings
+        {
+            public bool GroupedWithComma_AllowDecimalsOptional { get; init; } = true;  // 1,234 or 1,234.50
+            public bool NoComma_AllowDecimalsOptional { get; init; } = true;          // 1234 or 1234.50
+            public bool AllowParenthesesForNegatives { get; init; } = true;           // (1,234.50)
+        }
+
+        public static class Profiles
+        {
+            // Date patterns: d[-/.]m[-/.]{2-4-digit-year} | yyyy[-/.]m[-/.]d
+            private const string DatePatClassic = @"\d{1,2}(?:[-/–—.])(?:\d{1,2}|[A-Za-z]{3,9})(?:[-/–—.])\d{2,4}";
+            private const string DatePatIso = @"\d{4}(?:[-/–—.])\d{1,2}(?:[-/–—.])\d{1,2}";
+            private const string DatePatDots = @"\d{1,2}\.\d{1,2}\.\d{2,4}";
+            private const string DatePatAny = $"(?:{DatePatClassic}|{DatePatIso}|{DatePatDots})";
+
+            private static Regex BuildMoneyRegex(MoneySettings h)
+            {
+                var parts = new List<string>();
+                if (h.GroupedWithComma_AllowDecimalsOptional)
+                    parts.Add(@"\-?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?");
+                if (h.NoComma_AllowDecimalsOptional)
+                    parts.Add(@"\-?\d+(?:\.\d{1,2})?");
+
+                // Accept optional parentheses and optional trailing CR/DR
+                var core = string.Join("|", parts);
+                var withCrDr = $@"(?:{core})(?:\s*(?:CR|DR))?";
+                if (h.AllowParenthesesForNegatives)
+                    withCrDr = $@"^\(?{withCrDr}\)?$";
+                else
+                    withCrDr = $@"^{withCrDr}$";
+
+                return new Regex(withCrDr, RegexOptions.Compiled | RegexOptions.IgnoreCase);
+            }
+
+            private static Profile BuildBase(
+                string bankName,
+                string[] dateFormats,
+                MoneySettings money,
+                string[] cutMarkers,
+                Regex? pageTail,
+                Regex? gluedTail)
+            {
+                var dateAnyRx = new Regex(DatePatAny, RegexOptions.Compiled | RegexOptions.IgnoreCase);
+                var rowSplitAnyDateRx = new Regex($@"(?=(?:^|(?<=\s)){DatePatAny}\b)",
+                                                  RegexOptions.Compiled | RegexOptions.IgnoreCase);
+                var moneyRx = BuildMoneyRegex(money);
+
+                return new Profile
+                {
+                    BankName = bankName,
+                    DateFormats = dateFormats,
+                    Money = money,
+
+                    CutMarkers = cutMarkers,
+                    PageCounterTailRx = pageTail,
+                    GluedHeadersTailRx = gluedTail,
+
+                    DateAnyRx = dateAnyRx,
+                    RowSplitAnyDateRx = rowSplitAnyDateRx,
+                    MoneyCoreRx = moneyRx
+                };
+            }
+
+            public static Profile Default()
+            {
+                return BuildBase(
+                    bankName: "Generic (Auto)",
+                    dateFormats: new[]
+                    {
+                        "dd/MM/yyyy","d/M/yyyy","dd-MM-yyyy","d-M-yyyy","dd.M.yyyy","d.M.yyyy",
+                        "dd-MMM-yyyy","d-MMM-yyyy","dd MMM yyyy","d MMM yyyy",
+                        "yyyy-MM-dd","yyyy/MM/dd","yyyy.MM.dd","MM/dd/yyyy","M/d/yyyy"
+                    },
+                    money: new MoneySettings
+                    {
+                        GroupedWithComma_AllowDecimalsOptional = true,
+                        NoComma_AllowDecimalsOptional = true,
+                        AllowParenthesesForNegatives = true
+                    },
+                    cutMarkers: new[]
+                    {
+                        "Disclaimer", "Computer generated copy", "Account owner", "Name of account",
+                        "Company Registration No.", "VAT Reg", "TEL:", "Plot", "BANK STATEMENT", "Statement number",
+                        "Statement date", "Date Range", "End of report", "Summary of transactions",
+                        "Transaction date Value date Transaction description Debits Credits Balance", "Printed"
+                    },
+                    pageTail: new Regex(@"(?:\bPage\s+\d+\s+of\s+\d+\b.*|[_\s]*\b\d{1,3}\s*/\s*\d{1,3}\b.*)$",
+                                        RegexOptions.Compiled | RegexOptions.IgnoreCase),
+                    gluedTail: new Regex(@"(?:\|\s*)?(?:Debit:.*|Credit:.*|Balance:.*)$",
+                                         RegexOptions.Compiled | RegexOptions.IgnoreCase)
+                );
+            }
+
+            public static Profile StanbicUg()
+            {
+                // Uses Default date/money but trims some Stanbic boilerplate
+                var baseP = Default();
+                return BuildBase(
+                    bankName: "Stanbic (UG) - Generic",
+                    dateFormats: baseP.DateFormats,
+                    money: baseP.Money,
+                    cutMarkers: new[]
+                    {
+                        "Stanbic Bank Uganda Limited", "Account type", "Account currency",
+                        "BANK STATEMENT", "TAX INVOICE", "Summary of transactions"
+                    },
+                    pageTail: baseP.PageCounterTailRx,
+                    gluedTail: baseP.GluedHeadersTailRx
+                );
+            }
+
+            public static Profile Centenary()
+            {
+                var baseP = Default();
+                return BuildBase(
+                    bankName: "Centenary Bank (UG)",
+                    dateFormats: baseP.DateFormats,
+                    money: baseP.Money,
+                    cutMarkers: new[]
+                    {
+                        "Centenary", "Centenary Bank", "DEMAND DEPOSIT STATEMENT", "Branch", "e-mail", "PAGE:",
+                        "SUMMARY OF TRANSACTIONS", "BOOK BALANCE:", "AVAILABLE BALANCE:", "UNCLEAR BALANCE:"
+                    },
+                    pageTail: baseP.PageCounterTailRx,
+                    gluedTail: baseP.GluedHeadersTailRx
+                );
+            }
+
+            public static Profile Equity()
+            {
+                var baseP = Default();
+                return BuildBase(
+                    bankName: "Equity Bank (UG)",
+                    dateFormats: baseP.DateFormats,
+                    money: baseP.Money,
+                    cutMarkers: new[]
+                    {
+                        "EQUITY BANK", "Account Statement", "Statement Period", "Opening Balance", "Closing Balance",
+                        "Total Debit", "Total Credit", "Summary", "Disclaimer", "Grand Total"
+                    },
+                    pageTail: baseP.PageCounterTailRx,
+                    gluedTail: baseP.GluedHeadersTailRx
+                );
+            }
+        }
+    }
+
+}
