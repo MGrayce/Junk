@@ -65,7 +65,14 @@ namespace UG_DT_DeepLenz.parsers
 
             // ---- Stitch lines into blobs (each blob begins when a new date appears)
             var blobs = Stitch(lines, p);
-            Log($"[Diag] Blobs: {blobs.Count}");
+            if (blobs.Count == 0)
+            {
+                // Fallback: no line matched date-at-start; treat each line with date or money as its own blob so we still extract rows/D&C
+                blobs = StitchFallback(lines, p);
+                Log($"[Diag] Blobs (fallback): {blobs.Count}");
+            }
+            else
+                Log($"[Diag] Blobs: {blobs.Count}");
 
             if (blobs.Count == 0) return outRows;
 
@@ -300,6 +307,19 @@ namespace UG_DT_DeepLenz.parsers
             }
 
             if (buf.Length > 0) output.Add(buf.ToString().Trim());
+            return output;
+        }
+
+        /// <summary>When Stitch gives 0 blobs (no line starts with a date), form one blob per line that contains a date or money so we can still extract rows and D/C.</summary>
+        private static List<string> StitchFallback(List<string> lines, Profile p)
+        {
+            var output = new List<string>();
+            foreach (var l in lines)
+            {
+                if (string.IsNullOrWhiteSpace(l)) continue;
+                if (p.DateAnyRx.IsMatch(l) || LineHasMoney(l, p))
+                    output.Add(l.Trim());
+            }
             return output;
         }
 
