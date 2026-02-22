@@ -659,7 +659,13 @@ namespace UG_DT_DeepLenz.parsers
         private static Profile? DetectProfile(string text)
         {
             if (text.IndexOf("STANBIC", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                // Stanbic with Balance column → compute D/C from balance deltas (intended logic)
+                if (text.IndexOf("Opening balance", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    text.IndexOf("Closing balance", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return Profiles.StanbicUgWithBalance();
                 return Profiles.StanbicUg();
+            }
             if (text.IndexOf("CENTENARY", StringComparison.OrdinalIgnoreCase) >= 0)
                 return Profiles.Centenary();
             if (text.IndexOf("EQUITY", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -795,6 +801,29 @@ namespace UG_DT_DeepLenz.parsers
                 );
             }
 
+            /// <summary>Stanbic with Balance column: D/C computed from balance deltas (intended logic).</summary>
+            public static Profile StanbicUgWithBalance()
+            {
+                var baseP = Default();
+                return BuildBase(
+                    bankName: "Stanbic (UG) - with Balance column",
+                    dateFormats: baseP.DateFormats,
+                    money: baseP.Money,
+                    cutMarkers: new[]
+                    {
+                        "Stanbic Bank Uganda Limited", "Account type", "Account currency",
+                        "BANK STATEMENT", "TAX INVOICE", "Summary of transactions",
+                        "Transaction date Value date Transaction description Debits Credits Balance",
+                        "Transaction Date Value Date Transaction description Debits Credits Balance",
+                        "Computer generated copy", "End of report", "Disclaimer"
+                    },
+                    pageTail: baseP.PageCounterTailRx,
+                    gluedTail: baseP.GluedHeadersTailRx,
+                    singleAmountPerRow: false
+                );
+            }
+
+            /// <summary>Stanbic EDL-style: single amount per row, no balance column; D/C from description keywords.</summary>
             public static Profile StanbicUg()
             {
                 var baseP = Default();
