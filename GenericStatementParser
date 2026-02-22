@@ -101,8 +101,14 @@ namespace UG_DT_DeepLenz.parsers
             // ---- Enforce: rows must have at least one date
             outRows = outRows.Where(r => r.TransactionDate.HasValue || r.ValueDate.HasValue).ToList();
 
-            // ---- Compute Debits/Credits from balance deltas (primary logic for D/C)
-            outRows = ComputeDebitsCreditsFromBalance(outRows);
+            // ---- Compute Debits/Credits: from balance deltas OR from single amount + description keywords
+            if (p.SingleAmountPerRow)
+                outRows = ClassifyDebitCreditFromDescription(outRows, p);
+            else
+                outRows = ComputeDebitsCreditsFromBalance(outRows);
+
+            // ---- Optional: remove duplicate rows (same date, value date, description, amount)
+            outRows = DedupeByKey(outRows);
 
             if (outRows.Count > 0)
             {
@@ -175,6 +181,42 @@ namespace UG_DT_DeepLenz.parsers
                 Description = desc,
                 Balance = balance
             };
+        }
+
+        // ----------------- Post-pass: D/C from single amount + description keywords (no balance column) -----------------
+
+        private List<ValueDateTxn> ClassifyDebitCreditFromDescription(List<ValueDateTxn> rows, Profile p)
+        {
+            foreach (var r in rows)
+            {
+                if (ContainsIgnoreMarker(r.Description))
+                {
+                    r.Debit = null; r.Credit = null;
+                    continue;
+                }
+                decimal amount = r.Balance;
+                if (amount == 0) { r.Debit = null; r.Credit = null; continue; }
+                var up = (r.Description ?? "").ToUpperInvariant();
+                bool isDebit = p.DebitKeywords.Length > 0 && p.DebitKeywords.Any(k => up.Contains(k));
+                bool isCredit = p.CreditKeywords.Length > 0 && p.CreditKeywords.Any(k => up.Contains(k));
+                if (isDebit && !isCredit) { r.Debit = amount; r.Credit = null; }
+                else if (isCredit && !isDebit) { r.Credit = amount; r.Debit = null; }
+                else if (isDebit && isCredit) { r.Debit = amount; r.Credit = null; } // ambiguous → treat as debit
+                else { r.Debit = amount; r.Credit = null; } // default: treat as debit (outflow) when unknown
+            }
+            return rows;
+        }
+
+        private static List<ValueDateTxn> DedupeByKey(List<ValueDateTxn> rows)
+        {
+            var seen = new HashSet<string>();
+            var outList = new List<ValueDateTxn>(rows.Count);
+            foreach (var r in rows)
+            {
+                var key = $"{r.TransactionDate?.ToString("yyyy-MM-dd")}|{r.ValueDate?.ToString("yyyy-MM-dd")}|{r.Description?.Trim()}|{r.Balance}|{r.Debit}|{r.Credit}";
+                if (seen.Add(key)) outList.Add(r);
+            }
+            return outList;
         }
 
         // ----------------- Post-pass: D/C from balance deltas -----------------
@@ -635,6 +677,11 @@ namespace UG_DT_DeepLenz.parsers
             public Regex? PageCounterTailRx { get; init; }
             public Regex? GluedHeadersTailRx { get; init; }
 
+            /// <summary>When true, statement has one amount per row (no balance column). D/C set from description keywords.</summary>
+            public bool SingleAmountPerRow { get; init; }
+            public string[] DebitKeywords { get; init; } = Array.Empty<string>();
+            public string[] CreditKeywords { get; init; } = Array.Empty<string>();
+
             // Compiled helpers
             public Regex DateAnyRx { get; init; } = null!;
             public Regex RowSplitAnyDateRx { get; init; } = null!;
@@ -688,7 +735,10 @@ namespace UG_DT_DeepLenz.parsers
                 MoneySettings money,
                 string[] cutMarkers,
                 Regex? pageTail,
-                Regex? gluedTail)
+                Regex? gluedTail,
+                bool singleAmountPerRow = false,
+                string[]? debitKeywords = null,
+                string[]? creditKeywords = null)
             {
                 var dateAnyRx = new Regex(DatePatAny, RegexOptions.Compiled | RegexOptions.IgnoreCase);
                 var rowSplitAnyDateRx = new Regex($@"(?=(?:^|(?<=\s)){DatePatAny}\b)",
@@ -704,6 +754,10 @@ namespace UG_DT_DeepLenz.parsers
                     CutMarkers = cutMarkers,
                     PageCounterTailRx = pageTail,
                     GluedHeadersTailRx = gluedTail,
+
+                    SingleAmountPerRow = singleAmountPerRow,
+                    DebitKeywords = debitKeywords ?? Array.Empty<string>(),
+                    CreditKeywords = creditKeywords ?? Array.Empty<string>(),
 
                     DateAnyRx = dateAnyRx,
                     RowSplitAnyDateRx = rowSplitAnyDateRx,
@@ -745,16 +799,30 @@ namespace UG_DT_DeepLenz.parsers
             {
                 var baseP = Default();
                 return BuildBase(
-                    bankName: "Stanbic (UG) - Generic",
+                    bankName: "Stanbic (UG) - EDL / single-amount",
                     dateFormats: baseP.DateFormats,
                     money: baseP.Money,
                     cutMarkers: new[]
                     {
                         "Stanbic Bank Uganda Limited", "Account type", "Account currency",
-                        "BANK STATEMENT", "TAX INVOICE", "Summary of transactions"
+                        "BANK STATEMENT", "TAX INVOICE", "Summary of transactions",
+                        "Transaction Date Value Date Description Debit Credit Balance"
                     },
                     pageTail: baseP.PageCounterTailRx,
-                    gluedTail: baseP.GluedHeadersTailRx
+                    gluedTail: baseP.GluedHeadersTailRx,
+                    singleAmountPerRow: true,
+                    debitKeywords: new[]
+                    {
+                        " TO UBL ", " TO UBL", "BEER TO UBL", "SPIRITS TO UBL", "SPIRIT TO UBL",
+                        "PAYMENT", "PAYTS", "PAYMENT TO", "INTERNET PAYMENT", "FUEL PAYMENT",
+                        "FEE", "DUTY", "EXCISE", "PURCHASE", "BOL ", " KUZA BOL ", " BOL "
+                    },
+                    creditKeywords: new[]
+                    {
+                        "BEER SALES", "SALES ", "COLLECTION", "ALCOHOL SALES", "BEVERAGES",
+                        "EVEREST SHARON", "SHARON ", "GERALD ", "BRIDGET ", "JULIE ", "NIRAV ",
+                        "PATEL COLLECTION", "SOKONI AFRICA"
+                    }
                 );
             }
 
