@@ -328,16 +328,29 @@ namespace UG_DT_DeepLenz.parsers
             int lastDateIdx = -1;
             int lastMoneyIdx = -1;
 
+            // Single-token and multi-token date (e.g. "22 02 2025")
             for (int i = 0; i < tokens.Count; i++)
             {
-                if (p.DateAnyRx.IsMatch(tokens[i])) lastDateIdx = i;
+                if (p.DateAnyRx.IsMatch(tokens[i])) { lastDateIdx = i; continue; }
+                if (i + 1 < tokens.Count)
+                {
+                    var s2 = string.Join(" ", tokens.Skip(i).Take(2));
+                    if (p.DateAnyRx.IsMatch(s2)) { lastDateIdx = i + 1; continue; }
+                }
+                if (i + 2 < tokens.Count)
+                {
+                    var s3 = string.Join(" ", tokens.Skip(i).Take(3));
+                    if (p.DateAnyRx.IsMatch(s3)) { lastDateIdx = i + 2; continue; }
+                }
+            }
+            for (int i = 0; i < tokens.Count; i++)
+            {
                 bool moneyHere = LooksLikeMoney(tokens[i], p)
                                  || (i + 1 < tokens.Count && IsCrDr(tokens[i + 1]) && LooksLikeMoney(tokens[i], p))
                                  || MoneyZeroRx.IsMatch(tokens[i])
                                  || PlainIntRx.IsMatch(tokens[i]);
                 if (moneyHere) lastMoneyIdx = i;
             }
-            // CR/DR as separate token after amount
             for (int i = 0; i < tokens.Count - 1; i++)
             {
                 if (IsCrDr(tokens[i + 1]) && LooksLikeMoney(tokens[i], p))
@@ -381,7 +394,9 @@ namespace UG_DT_DeepLenz.parsers
             "dd.MM.yyyy", "d.M.yyyy", "dd.MM.yy", "d.M.yy",
             "dd MMM yyyy", "d MMM yyyy",
             "dd MMMM yyyy", "d MMMM yyyy",
-            "MM/dd/yyyy", "M/d/yyyy"
+            "MM/dd/yyyy", "M/d/yyyy",
+            "dd MM yyyy", "d M yyyy", "dd MM yy", "d M yy",
+            "yyyy MM dd"
         };
 
         private static bool TryParseDateFlexible(string s, Profile p, out DateTime dt)
@@ -410,33 +425,55 @@ namespace UG_DT_DeepLenz.parsers
             out DateTime? tran, out DateTime? value, out int firstNonDateIdx)
         {
             tran = null; value = null; firstNonDateIdx = 0;
-            var idxs = new List<int>();
+            // (startIndex, tokenLength) for each date found (so we support multi-token dates like "22 Feb 2025")
+            var dateSpans = new List<(int start, int len)>();
 
-            for (int i = 0; i < tokens.Count; i++)
+            for (int i = 0; i < tokens.Count && dateSpans.Count < 2; )
             {
-                var tok = tokens[i];
-                if (p.DateAnyRx.IsMatch(tok) && TryParseDateFlexible(tok, p, out var d))
+                int len = 0;
+                DateTime dt;
+
+                // Try 3 tokens (e.g. "22 02 2025" or "22 Feb 2025")
+                if (i + 2 < tokens.Count)
                 {
-                    idxs.Add(i);
-                    if (idxs.Count == 2) break;
+                    var s3 = string.Join(" ", tokens.Skip(i).Take(3));
+                    if (p.DateAnyRx.IsMatch(s3) && TryParseDateFlexible(s3, p, out dt)) len = 3;
                 }
+                // Try 2 tokens
+                if (len == 0 && i + 1 < tokens.Count)
+                {
+                    var s2 = string.Join(" ", tokens.Skip(i).Take(2));
+                    if (p.DateAnyRx.IsMatch(s2) && TryParseDateFlexible(s2, p, out dt)) len = 2;
+                }
+                // Try 1 token
+                if (len == 0 && p.DateAnyRx.IsMatch(tokens[i]) && TryParseDateFlexible(tokens[i], p, out dt)) len = 1;
+
+                if (len > 0)
+                {
+                    dateSpans.Add((i, len));
+                    i += len;
+                }
+                else
+                    i++;
             }
 
-            if (idxs.Count == 0) return false;
+            if (dateSpans.Count == 0) return false;
 
-            var i1 = idxs[0];
-            tran = TryParseDateFlexible(tokens[i1], p, out var d1) ? d1 : (DateTime?)null;
+            var (start1, len1) = dateSpans[0];
+            var dateStr1 = string.Join(" ", tokens.Skip(start1).Take(len1));
+            tran = TryParseDateFlexible(dateStr1, p, out var d1) ? d1 : (DateTime?)null;
 
-            if (idxs.Count > 1)
+            if (dateSpans.Count > 1)
             {
-                var i2 = idxs[1];
-                value = TryParseDateFlexible(tokens[i2], p, out var d2) ? d2 : (DateTime?)null;
-                firstNonDateIdx = Math.Max(i1, i2) + 1;
+                var (start2, len2) = dateSpans[1];
+                var dateStr2 = string.Join(" ", tokens.Skip(start2).Take(len2));
+                value = TryParseDateFlexible(dateStr2, p, out var d2) ? d2 : (DateTime?)null;
+                firstNonDateIdx = Math.Max(start1 + len1, start2 + len2);
             }
             else
             {
                 value = tran;
-                firstNonDateIdx = i1 + 1;
+                firstNonDateIdx = start1 + len1;
             }
 
             return tran.HasValue || value.HasValue;
@@ -616,11 +653,15 @@ namespace UG_DT_DeepLenz.parsers
 
         public static class Profiles
         {
-            // Date patterns: d[-/.]m[-/.]{2-4-digit-year} | yyyy[-/.]m[-/.]d
+            // Date patterns: d[-/.]m[-/.]{2-4-digit-year} | yyyy[-/.]m[-/.]d | space-separated
             private const string DatePatClassic = @"\d{1,2}(?:[-/–—.])(?:\d{1,2}|[A-Za-z]{3,9})(?:[-/–—.])\d{2,4}";
             private const string DatePatIso = @"\d{4}(?:[-/–—.])\d{1,2}(?:[-/–—.])\d{1,2}";
             private const string DatePatDots = @"\d{1,2}\.\d{1,2}\.\d{2,4}";
-            private const string DatePatAny = $"(?:{DatePatClassic}|{DatePatIso}|{DatePatDots})";
+            // Space-separated (e.g. "22 02 2025", "22 Feb 2025", "2025 02 22") so blob-start matches
+            private const string DatePatSpace = @"\d{1,2}\s+\d{1,2}\s+\d{2,4}";
+            private const string DatePatSpaceMonth = @"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}";
+            private const string DatePatIsoSpace = @"\d{4}\s+\d{1,2}\s+\d{1,2}";
+            private const string DatePatAny = $"(?:{DatePatClassic}|{DatePatIso}|{DatePatDots}|{DatePatSpace}|{DatePatSpaceMonth}|{DatePatIsoSpace})";
 
             private static Regex BuildMoneyRegex(MoneySettings h)
             {
