@@ -73,7 +73,7 @@ namespace UG_DT_DeepLenz.parsers
             var rowCandidates = blobs.SelectMany(b => SplitRowsByAnyDate(b, p)).ToList();
             Log($"[Diag] Row candidates: {rowCandidates.Count}");
 
-            // ---- Parse rows (balance-first)
+            // ---- Parse rows (balance-first); D/C computed from balance deltas later
             int droppedNoDates = 0, droppedNoBalance = 0;
             foreach (var rc in rowCandidates)
             {
@@ -90,8 +90,8 @@ namespace UG_DT_DeepLenz.parsers
                     TransactionDate = row.TranDate,
                     ValueDate = row.ValueDate,
                     Description = row.Description,
-                    Debit = null,   // computed later
-                    Credit = null,  // computed later
+                    Debit = null,   // computed from balance deltas below
+                    Credit = null,
                     Balance = row.Balance
                 });
             }
@@ -101,14 +101,14 @@ namespace UG_DT_DeepLenz.parsers
             // ---- Enforce: rows must have at least one date
             outRows = outRows.Where(r => r.TransactionDate.HasValue || r.ValueDate.HasValue).ToList();
 
-            // ---- Compute Debits/Credits from balance deltas
+            // ---- Compute Debits/Credits from balance deltas (primary logic for D/C)
             outRows = ComputeDebitsCreditsFromBalance(outRows);
 
             if (outRows.Count > 0)
             {
                 var f = outRows[0]; var l = outRows[^1];
-                Log($"[Diag] First: {f.TransactionDate:dd/MM/yyyy} {f.ValueDate:dd/MM/yyyy} | {f.Description} | D:{f.Debit} C:{f.Credit} Bal:{f.Balance}");
-                Log($"[Diag] Last : {l.TransactionDate:dd/MM/yyyy} {l.ValueDate:dd/MM/yyyy} | {l.Description} | D:{l.Debit} C:{l.Credit} Bal:{l.Balance}");
+                Log($"[Diag] First: {f.TransactionDate?.ToString("dd/MM/yyyy")} {f.ValueDate?.ToString("dd/MM/yyyy")} | {f.Description} | D:{f.Debit} C:{f.Credit} Bal:{f.Balance}");
+                Log($"[Diag] Last : {l.TransactionDate?.ToString("dd/MM/yyyy")} {l.ValueDate?.ToString("dd/MM/yyyy")} | {l.Description} | D:{l.Debit} C:{l.Credit} Bal:{l.Balance}");
             }
 
             return outRows;
@@ -131,7 +131,7 @@ namespace UG_DT_DeepLenz.parsers
             droppedNoDates = droppedNoBalance = false;
             if (string.IsNullOrWhiteSpace(s)) { droppedNoDates = true; return null; }
 
-            // Trim any trailing non-row markers and keep up to last money-like token
+            // Trim trailing junk but preserve last date so we don't drop date when balance appears first
             s = TruncateAfterFinalMoney(s, p);
 
             // Tokenize
@@ -148,8 +148,10 @@ namespace UG_DT_DeepLenz.parsers
             // Find rightmost money (Balance). Accept CR/DR suffixes and split CR/DR tokens.
             if (!TryFindRightmostBalance(tokens, p, out var balIndex, out var balance))
             {
+                // Still emit a row when we have dates so we get transactions; D/C will be from deltas where balance exists
                 droppedNoBalance = true;
-                return null;
+                balance = 0m;
+                balIndex = tokens.Count;
             }
 
             // Description: tokens between (last date token) and the balance token
@@ -175,7 +177,7 @@ namespace UG_DT_DeepLenz.parsers
             };
         }
 
-        // ----------------- Post-pass D/C from balance deltas -----------------
+        // ----------------- Post-pass: D/C from balance deltas -----------------
 
         private List<ValueDateTxn> ComputeDebitsCreditsFromBalance(List<ValueDateTxn> rows)
         {
@@ -306,6 +308,10 @@ namespace UG_DT_DeepLenz.parsers
             return false;
         }
 
+        /// <summary>
+        /// Truncate line after the last meaningful token, but never drop the last date.
+        /// Keeps tokens from start through max(last date index, last money index).
+        /// </summary>
         private static string TruncateAfterFinalMoney(string line, Profile p)
         {
             if (string.IsNullOrWhiteSpace(line)) return line;
@@ -317,22 +323,35 @@ namespace UG_DT_DeepLenz.parsers
                 line = p.GluedHeadersTailRx.Replace(line, "");
 
             var tokens = Split(line);
-            for (int i = tokens.Count - 1; i >= 0; i--)
+            if (tokens.Count == 0) return line;
+
+            int lastDateIdx = -1;
+            int lastMoneyIdx = -1;
+
+            for (int i = 0; i < tokens.Count; i++)
             {
-                var tok = tokens[i];
-                bool moneyHere = LooksLikeMoney(tok, p)
-                                 || (i - 1 >= 0 && IsCrDr(tok) && LooksLikeMoney(tokens[i - 1], p))
-                                 || MoneyZeroRx.IsMatch(tok)
-                                 || PlainIntRx.IsMatch(tok);
-                if (moneyHere)
-                    return string.Join(" ", tokens.Take(i + 1));
+                if (p.DateAnyRx.IsMatch(tokens[i])) lastDateIdx = i;
+                bool moneyHere = LooksLikeMoney(tokens[i], p)
+                                 || (i + 1 < tokens.Count && IsCrDr(tokens[i + 1]) && LooksLikeMoney(tokens[i], p))
+                                 || MoneyZeroRx.IsMatch(tokens[i])
+                                 || PlainIntRx.IsMatch(tokens[i]);
+                if (moneyHere) lastMoneyIdx = i;
             }
+            // CR/DR as separate token after amount
+            for (int i = 0; i < tokens.Count - 1; i++)
+            {
+                if (IsCrDr(tokens[i + 1]) && LooksLikeMoney(tokens[i], p))
+                    lastMoneyIdx = Math.Max(lastMoneyIdx, i + 1);
+            }
+
+            int keepThrough = Math.Max(lastDateIdx, lastMoneyIdx);
+            if (keepThrough >= 0)
+                return string.Join(" ", tokens.Take(keepThrough + 1));
+
             return line;
         }
 
         // Returns true if the line contains something that looks like a money token.
-        // We accept core money (with UGX prefix/suffix, commas, decimals, parentheses)
-        // and also tolerate plain integers / zeros (common after aggressive OCR).
         private static bool LineHasMoney(string line, Profile p)
         {
             if (string.IsNullOrWhiteSpace(line)) return false;
@@ -342,8 +361,7 @@ namespace UG_DT_DeepLenz.parsers
                 if (LooksLikeMoney(tok, p))                  // e.g., "123,456.00", "(1,234)", "2,000CR"
                     return true;
 
-                // Fallbacks: allow isolated "0"/"0.00" and smallish plain ints
-                if (MoneyZeroRx.IsMatch(tok) || PlainIntRx.IsMatch(tok))
+                if (MoneyZeroRx.IsMatch(tok) || PlainIntRx.IsMatch(tok) || LooseMoneyRx.IsMatch(tok))
                     return true;
             }
             return false;
@@ -431,6 +449,8 @@ namespace UG_DT_DeepLenz.parsers
 
         private static readonly Regex MoneyZeroRx = new(@"^\(?0+(?:\.0{1,2})?\)?$", RegexOptions.Compiled);
         private static readonly Regex PlainIntRx = new(@"^\-?\(?\d{1,12}\)?$", RegexOptions.Compiled);
+        /// <summary>Permissive fallback: digits with optional commas/dots and optional parentheses (avoids long refs).</summary>
+        private static readonly Regex LooseMoneyRx = new(@"^\-?\(?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\)?$|^\-?\(?\d+(?:\.\d{1,2})?\)?$", RegexOptions.Compiled);
 
         private static bool LooksLikeMoney(string s, Profile p)
         {
@@ -441,7 +461,7 @@ namespace UG_DT_DeepLenz.parsers
 
             // Allow trailing CR/DR by stripping for the core check
             var core = CrDrSuffixRx.Replace(s, "");
-            return p.MoneyCoreRx.IsMatch(core);
+            return p.MoneyCoreRx.IsMatch(core) || LooseMoneyRx.IsMatch(core);
         }
 
         private static decimal? ParseMoney(string s, Profile p)
@@ -522,6 +542,18 @@ namespace UG_DT_DeepLenz.parsers
                 }
             }
 
+            // Pass 4: permissive number pattern (handles odd formatting / OCR)
+            for (int i = tokens.Count - 1; i >= 0; i--)
+            {
+                var tok = tokens[i];
+                if (!LooseMoneyRx.IsMatch(tok)) continue;
+                var core = tok.Trim('(', ')').Replace(",", "");
+                if (!decimal.TryParse(core, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint,
+                        CultureInfo.InvariantCulture, out var v4)) continue;
+                if (tok.StartsWith("(") && tok.EndsWith(")")) v4 = -Math.Abs(v4);
+                index = i; value = v4; return true;
+            }
+
             index = -1; value = default;
             return false;
         }
@@ -547,7 +579,6 @@ namespace UG_DT_DeepLenz.parsers
 
         private static Profile? DetectProfile(string text)
         {
-            // Extend this if you want bank-specific cut markers / formats
             if (text.IndexOf("STANBIC", StringComparison.OrdinalIgnoreCase) >= 0)
                 return Profiles.StanbicUg();
             if (text.IndexOf("CENTENARY", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -671,7 +702,6 @@ namespace UG_DT_DeepLenz.parsers
 
             public static Profile StanbicUg()
             {
-                // Uses Default date/money but trims some Stanbic boilerplate
                 var baseP = Default();
                 return BuildBase(
                     bankName: "Stanbic (UG) - Generic",
