@@ -1,0 +1,821 @@
+public sealed class GenericBalanceDeltaValueDateParser : IBankValueDateParser
+{
+    public string Bank => "Generic Balance Delta";
+
+    // ---------------- Configuration (generic defaults) ----------------
+    private static readonly string[] DateFormats =
+    {
+        "dd/MM/yyyy","MM/dd/yyyy","yyyy-MM-dd","dd-MM-yyyy","d/M/yyyy","M/d/yyyy",
+        "dd MMM yyyy","d MMM yyyy","dd-MMM-yyyy","d-MMM-yyyy","MMM dd, yyyy"
+    };
+
+    // Case-insensitive phrases that indicate header/footer or metadata lines to trim
+    private static readonly string[] CutMarkers =
+    {
+        "Computer generated copy",
+        "Disclaimer",
+        "End of report",
+        "Printed",
+        "Page ",
+        "TEL:",
+        "Transaction description", "Transaction", // column headers
+        "Account number", "Statement date", "Statement number", "Account type", "Account currency",
+        "Name of account", "Account owner", "Company Registration No.", "VAT Reg",
+        "Summary of transactions", "Credits", "Debits", "HEAD OFFICE","Nairobi","Account No.", "Branch Manager"
+    };
+
+    // Case-insensitive phrases that indicate a row should be omitted entirely
+    private static readonly string[] RowOmitMarkers =
+    {
+        "PROVISIONAL",           // "provisional and have not yet been paid"
+        "PLEASE VERIFY",
+        "SUMMARY OF TRANSACTIONS",
+        "DISCLAIMER",
+        "END OF REPORT",
+        "PRINTED",
+        "COMPUTER GENERATED COPY",
+        "COMPANY REGISTRATION NO.",
+        "NAME OF ACCOUNT",
+        "ACCOUNT OWNER",
+        "VAT REG",
+        "PAGE ",
+        "TEL:",  "HEAD OFFICE","NAIROBI","ACCOUNT N0.", "BRANCH MANAGER"
+    };
+
+    // Case-insensitive phrases for non-transaction rows to ignore but advance baseline
+    private static readonly string[] IgnoreDescMarkers =
+    {
+        "OPENING BALANCE", "OPENING", "BAL B/F", "B/F", "BROUGHT FORWARD","BEHALF","ACCOUNT NAME",
+        "CLOSING BALANCE", "CLOSING", "BAL C/F", "C/F", "CARRIED FORWARD", "BOOK BALANCE", "SUMMARY", "TOTAL", "UNPAID", "BRANCH"
+    };
+
+    // Hard-stop phrases after rows begin to avoid footer/totals/disclaimer tail
+    private static readonly string[] HardStopMarkersAfterRows =
+    {
+        "Summary of transactions", "End of report", "Disclaimer", "Printed", "Computer generated copy", "Page "
+    };
+
+    // Behavior toggles
+    private const bool RequireTwoMoneyFiguresExceptFirst = false;
+    private const bool FirstRowBypassTwoFigures = true;
+    private const bool UseFirstRowParsedAmountWhenBaselineExists = true;
+
+    // Chronology normalization toggle:
+    // If true, always sort rows ascending by ValueDate (then TransactionDate) before computing.
+    // If false, auto-detect descending input and sort ascending only when needed.
+    private const bool ForceSortChronologyAscending = true;
+
+    // ---------------- Regexes (generic) ----------------
+
+    // Heuristic: a row begins where a date-like token begins
+    private static readonly Regex RowSplit =
+        new(@"(?=\b(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4})\b)",
+            RegexOptions.Compiled);
+
+    // Recognize "opening balance ..." with date either before or after (very loose)
+    private static readonly Regex OpeningWithDateFirst =
+        new(@"^\s*(?<date>\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}-\d{2}-\d{2})\s+Opening balance\s+(?<amt>[^\s]+)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex OpeningWithDateAfter =
+        new(@"Opening balance(?:\s+(?<date>\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}-\d{2}-\d{2}))?\s+(?<amt>[^\s]+)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Money token (liberal)
+    private static readonly Regex MoneyTokenRx =
+        new(@"^\(?-?[\d.,\u00A0\s]+(?:[.,]\d{2})?\)?(?:\s?(?:CR|DR))?(?:\s?(?:[A-Z]{3}|UGX|TZS|KES|USD|EUR|\$|£|€|USh))?$",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Any date-like token we can try to parse (same as RowSplit triggers)
+    private static readonly Regex DateTokenRx =
+        new(@"\b(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4})\b",
+            RegexOptions.Compiled);
+
+    // New: address/header detection to prevent bleed
+    private static readonly Regex AddressWordsRx = new(
+        @"\b(PLOT|ROAD|RD\.?|STREET|AVE|AVENUE|WAY|LANE|PO BOX|P\.O\. BOX|BUILDING|TOWER|FLOOR|SUITE|WING)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public bool CanHandle(string rawText) => !string.IsNullOrWhiteSpace(rawText);
+
+    public IEnumerable<ValueDateTxn> Parse(string rawText)
+    {
+        if (string.IsNullOrWhiteSpace(rawText))
+            return Array.Empty<ValueDateTxn>();
+
+        // 1) Normalize & trim
+        var normalized = Normalize(rawText);
+
+        // 2) Hard cut after first "Closing balance" to prevent footer pollution
+        normalized = HardCutAfterClosingBalance(normalized);
+
+        // 3) Remove per-line metadata tails
+        var lines = normalized
+            .Split('\n')
+            .Select(CutLine)
+            .Where(l => !string.IsNullOrWhiteSpace(l))
+            .ToList();
+
+        // 4) Probe opening balance (generic)
+        DateTime? openingDate = null;
+        decimal? openingAmt = null;
+
+        foreach (var l in lines)
+        {
+            var m1 = OpeningWithDateFirst.Match(l);
+            if (m1.Success &&
+                TryParseDate(m1.Groups["date"].Value, out var d1) &&
+                TryParseMoneyUniversal(m1.Groups["amt"].Value, out var ob1, out _, out _))
+            {
+                openingDate = d1; openingAmt = ob1; break;
+            }
+
+            var m2 = OpeningWithDateAfter.Match(l);
+            if (m2.Success &&
+                TryParseMoneyUniversal(m2.Groups["amt"].Value, out var ob2, out _, out _))
+            {
+                openingAmt = ob2;
+                if (m2.Groups["date"].Success && TryParseDate(m2.Groups["date"].Value, out var d2))
+                    openingDate = d2;
+                break;
+            }
+        }
+
+        // 5) Stitch multi-line rows (hardened against headers/addresses)
+        var stitched = Stitch(lines);
+
+        // 6) Parse rows
+        var parsedRows = stitched
+            .SelectMany(SplitRows)
+            .Where(s => !ShouldOmitRow(s))
+            .Select(ParseRow)
+            .Where(r => r != null)!
+            .Select(r => r!)
+            .ToList();
+
+        if (!openingDate.HasValue && parsedRows.Count > 0)
+            openingDate = parsedRows.Min(r => r.ValueDate);
+
+        // 7) Chronology normalization + recompute debit/credit by deltas
+        if (parsedRows.Count == 0)
+            return new List<ValueDateTxn>();
+
+        var chronoRows = ForceSortChronologyAscending
+            ? SortChronologicallyAscending(parsedRows)
+            : (IsMostlyDescendingByDate(parsedRows) ? SortChronologicallyAscending(parsedRows) : parsedRows);
+
+        var result = new List<ValueDateTxn>();
+        decimal? baseline = openingAmt;
+        bool firstTxnSeen = false;
+
+        for (int i = 0; i < chronoRows.Count; i++)
+        {
+            var r = chronoRows[i];
+
+            // Final guard: omit noisy/summary rows
+            if (ShouldOmitRow(r.Description))
+            {
+                baseline = r.Balance;
+                continue;
+            }
+
+            // --- SPECIAL EXCEPTION: Allow Opening Balance row to be returned ---
+            if (!firstTxnSeen && IsOpeningBalance(r.Description))
+            {
+                result.Add(new ValueDateTxn
+                {
+                    TransactionDate = r.TransactionDate,
+                    ValueDate = r.ValueDate,
+                    Description = r.Description,
+                    Debit = null,
+                    Credit = null,
+                    Balance = r.Balance
+                });
+                baseline = r.Balance;
+                firstTxnSeen = true;
+                continue;
+            }
+
+            // --- SPECIAL EXCEPTION: Allow Closing Balance row to be returned ---
+            if (r.IsClosing)
+            {
+                result.Add(new ValueDateTxn
+                {
+                    TransactionDate = r.TransactionDate,
+                    ValueDate = r.ValueDate,
+                    Description = r.Description,
+                    Debit = null,
+                    Credit = null,
+                    Balance = r.Balance
+                });
+                break; // stop parsing after closing balance
+            }
+
+            // Normal ignore logic for summaries/etc
+            if (IsIgnorable(r.Description))
+            {
+                baseline = r.Balance;
+                continue;
+            }
+
+            // Minimal structure: require date + desc + balance
+            bool minimallyValid = r.TransactionDate.HasValue && !string.IsNullOrWhiteSpace(r.Description);
+            bool isFirstCandidate = !firstTxnSeen && minimallyValid;
+
+            if (isFirstCandidate)
+            {
+                // CASE 1: Opening balance → return as-is
+                if (IsOpeningBalance(r.Description))
+                {
+                    result.Add(new ValueDateTxn
+                    {
+                        TransactionDate = r.TransactionDate,
+                        ValueDate = r.ValueDate,
+                        Description = r.Description,
+                        Debit = null,
+                        Credit = null,
+                        Balance = r.Balance
+                    });
+
+                    baseline = r.Balance;
+                    firstTxnSeen = true;
+                    continue;
+                }
+
+                // CASE 2: First row is a REAL transaction (your case)
+                // If no baseline yet, we cannot compute delta → use the ROW'S AMOUNT
+                if (!baseline.HasValue)
+                {
+                    if (r.Amount.HasValue)
+                    {
+                        var amt = Math.Abs(r.Amount.Value);
+
+                        result.Add(new ValueDateTxn
+                        {
+                            TransactionDate = r.TransactionDate,
+                            ValueDate = r.ValueDate,
+                            Description = r.Description,
+                            Debit = (r.AmountHadDR ? amt : (decimal?)null),
+                            Credit = (r.AmountHadCR ? amt : (decimal?)null),
+                            Balance = r.Balance
+                        });
+
+                        // Seed baseline
+                        baseline = r.Balance;
+                        firstTxnSeen = true;
+                        continue;
+                    }
+                    else
+                    {
+                        // Fallback: If no amount parsed, treat as credit based on direction of balance change
+                        result.Add(new ValueDateTxn
+                        {
+                            TransactionDate = r.TransactionDate,
+                            ValueDate = r.ValueDate,
+                            Description = r.Description,
+                            Debit = null,
+                            Credit = null,
+                            Balance = r.Balance
+                        });
+
+                        baseline = r.Balance;
+                        firstTxnSeen = true;
+                        continue;
+                    }
+                }
+
+                // CASE 3: baseline exists → compute normal delta
+                var delta = r.Balance - baseline.Value;
+                var abs = Math.Abs(delta);
+
+                result.Add(new ValueDateTxn
+                {
+                    TransactionDate = r.TransactionDate,
+                    ValueDate = r.ValueDate,
+                    Description = r.Description,
+                    Debit = (delta < 0m) ? abs : (decimal?)null,
+                    Credit = (delta > 0m) ? abs : (decimal?)null,
+                    Balance = r.Balance
+                });
+
+                baseline = r.Balance;
+                firstTxnSeen = true;
+                continue;
+            }
+
+            // For subsequent rows, enforce "two figures" if configured
+            //if (RequireTwoMoneyFiguresExceptFirst && !r.HasSecondMoney)
+            //{
+            //    // IMPORTANT: Skip and DO NOT advance baseline to avoid header/address fragments corrupting baseline.
+            //    continue;
+            //}
+            // Allow single-money rows (very common in Centenary / Housing / Equity OCR)
+
+            // Initialize baseline late if needed (no output this turn)
+            if (!baseline.HasValue)
+            {
+                baseline = r.Balance;
+                continue;
+            }
+
+            var dlt = r.Balance - baseline.Value;
+            if (dlt != 0m)
+            {
+                var abs = Math.Abs(dlt);
+                result.Add(new ValueDateTxn
+                {
+                    TransactionDate = r.TransactionDate,
+                    ValueDate = r.ValueDate,
+                    Description = r.Description,
+                    Debit = (dlt < 0m) ? abs : (decimal?)null,
+                    Credit = (dlt > 0m) ? abs : (decimal?)null,
+                    Balance = r.Balance
+                });
+            }
+
+            baseline = r.Balance;
+            if (minimallyValid) firstTxnSeen = true;
+        }
+
+        return result;
+    }
+
+    private static bool IsOpeningBalance(string desc)
+    {
+        if (string.IsNullOrWhiteSpace(desc)) return false;
+
+        desc = desc.ToUpperInvariant();
+
+        return desc.Contains("OPENING BALANCE")
+            || desc.Contains("BAL B/F")
+            || desc.Contains("B/F")
+            || desc.Contains("BROUGHT FORWARD");
+    }
+
+    // ----------------- Row object & parsing -----------------
+
+    private sealed class Row
+    {
+        public DateTime? TransactionDate { get; init; }
+        public DateTime ValueDate { get; init; }
+        public string Description { get; init; } = "";
+        public decimal Balance { get; init; }
+        public bool IsClosing { get; init; }
+        public bool HasSecondMoney { get; init; }
+        public decimal? Amount { get; init; } // parsed amount (if present)
+        public bool AmountHadCR { get; init; }
+        public bool AmountHadDR { get; init; }
+    }
+
+    private static Row? ParseRow(string blob)
+    {
+        if (ShouldOmitRow(blob)) return null;
+
+        // Keep only up to final money token to avoid tail noise (HARDENED)
+        blob = TruncateAfterFinalMoney(blob);
+
+        var tokens = Split(blob);
+        if (tokens.Count == 0) return null;
+
+        // Find first date token (TransactionDate)
+        int idx = tokens.FindIndex(tok => IsDateToken(tok) && TryParseDate(tok, out _));
+        if (idx < 0) return null;
+
+        if (!TryParseDate(tokens[idx], out var txnDate))
+            return null;
+
+        // Optional ValueDate right after
+        DateTime valueDate = txnDate;
+        int descStart = idx + 1;
+        if (descStart < tokens.Count && IsDateToken(tokens[descStart]) && TryParseDate(tokens[descStart], out var vd))
+        {
+            valueDate = vd;
+            descStart++;
+        }
+
+        // Locate rightmost money token for Balance (HARDENED)
+        if (!TryFindRightmostBalance(tokens, out var balIndex, out var balValue))
+            return null;
+
+        // Description is tokens between descStart and balIndex
+        string desc = string.Join(" ", tokens.Skip(descStart).Take(Math.Max(0, balIndex - descStart))).Trim();
+
+        if (string.IsNullOrWhiteSpace(desc))
+            desc = "Transaction";
+
+
+        // Preceding amount (if any)
+        bool hasAmt = TryFindPrecedingAmount(tokens, descStart, balIndex, out var amt, out var hadCR, out var hadDR);
+
+        // Closing line?
+        bool isClosing = desc.IndexOf("closing balance", StringComparison.OrdinalIgnoreCase) >= 0
+                      || desc.IndexOf("bal c/f", StringComparison.OrdinalIgnoreCase) >= 0
+                      || desc.IndexOf("carried forward", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        return new Row
+        {
+            TransactionDate = txnDate,
+            ValueDate = valueDate,
+            Description = desc,
+            Balance = balValue,
+            IsClosing = isClosing,
+            HasSecondMoney = hasAmt,
+            Amount = hasAmt ? Math.Abs(amt) : (decimal?)null,
+            AmountHadCR = hadCR,
+            AmountHadDR = hadDR
+        };
+    }
+
+    // ----------------- Heuristics & helpers -----------------
+
+    private static bool IsIgnorable(string? desc)
+    {
+        if (string.IsNullOrWhiteSpace(desc)) return false;
+        var up = desc.ToUpperInvariant();
+        return IgnoreDescMarkers.Any(m => up.Contains(m));
+    }
+
+    private static bool ShouldOmitRow(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var up = text.ToUpperInvariant();
+        return RowOmitMarkers.Any(m => up.Contains(m));
+    }
+
+    private static IEnumerable<string> SplitRows(string blob) =>
+        RowSplit.Split(blob).Where(x => !string.IsNullOrWhiteSpace(x));
+
+    private static List<string> Stitch(List<string> lines)
+    {
+        var output = new List<string>();
+        var buf = new StringBuilder();
+        bool rowsStarted = false;
+
+        foreach (var l in lines)
+        {
+            if (ShouldOmitRow(l)) continue;
+
+            if (StartsRow(l))
+            {
+                rowsStarted = true;
+
+                if (buf.Length > 0)
+                {
+                    output.Add(buf.ToString().Trim());
+                    buf.Clear();
+                }
+                buf.Append(l);
+            }
+            else
+            {
+                if (!rowsStarted) continue;
+
+                if (IsHardStopLine(l)) break;
+
+                // NEW: if the line looks like a page header/address, DO NOT append it.
+                // Also flush the previous row so the header doesn't get glued to it.
+                if (IsLikelyAddressOrHeaderLine(l))
+                {
+                    if (buf.Length > 0)
+                    {
+                        output.Add(buf.ToString().Trim());
+                        buf.Clear();
+                    }
+                    continue;
+                }
+
+                if (IsOrphanAmountLine(l)) continue;
+
+                if (buf.Length > 0)
+                    buf.Append(' ').Append(l);
+            }
+        }
+
+        if (buf.Length > 0) output.Add(buf.ToString().Trim());
+        return output;
+
+        //static bool StartsRow(string ln)
+        //{
+        //    var t = Split(ln);
+        //    return t.Count > 0 && t.Any(tok => IsDateToken(tok) && TryParseDate(tok, out _));
+        //}
+
+        static bool StartsRow(string ln)
+        {
+            return DateTokenRx.IsMatch(ln);
+        }
+
+
+        bool IsHardStopLine(string ln)
+        {
+            var up = ln.ToUpperInvariant();
+            return HardStopMarkersAfterRows.Any(m => up.Contains(m.ToUpperInvariant()));
+        }
+
+        static bool IsOrphanAmountLine(string ln)
+        {
+            // A line with only a single money token and no date
+            var t = Split(ln);
+            if (t.Count == 1 && MoneyTokenRx.IsMatch(t[0]) && !IsDateToken(t[0])) return true;
+            return false;
+        }
+    }
+
+    private static bool IsLikelyAddressOrHeaderLine(string ln)
+    {
+        if (string.IsNullOrWhiteSpace(ln)) return false;
+        if (DateTokenRx.IsMatch(ln)) return false; // don't treat dated lines as header
+
+        // Strong signals: address-like words
+        if (AddressWordsRx.IsMatch(ln)) return true;
+
+        // Word-number-word pattern (e.g., "Plot 17 Hannington") and no currency/CR/DR
+        bool looksWordNumWord = Regex.IsMatch(ln, @"\b[A-Za-z]{2,}\s+\d{1,4}\s+[A-Za-z]{2,}\b");
+        bool hasCurrencyOrCrDr = Regex.IsMatch(ln, @"\b(UGX|TZS|KES|USD|EUR|GBP|ZAR|NGN|USh|CR|DR)\b", RegexOptions.IgnoreCase);
+        if (looksWordNumWord && !hasCurrencyOrCrDr) return true;
+
+        return false;
+    }
+
+    // Hardened truncation: only truncate if the tail after the last money token is ignorable
+    private static string TruncateAfterFinalMoney(string line)
+    {
+        var t = Split(line);
+        for (int i = t.Count - 1; i >= 0; i--)
+        {
+            var tok = t[i];
+            if (MoneyTokenRx.IsMatch(tok) && TryParseMoneyUniversal(tok, out _, out _, out _))
+            {
+                if (TailIsIgnorable(t, i + 1))
+                    return string.Join(" ", t.Take(i + 1));
+            }
+        }
+        return line;
+
+        static bool TailIsIgnorable(List<string> tokens, int start)
+        {
+            for (int j = start; j < tokens.Count; j++)
+            {
+                var u = tokens[j].ToUpperInvariant();
+                if (u == "CR" || u == "DR") continue;
+                if (Regex.IsMatch(tokens[j], @"^(UGX|TZS|KES|USD|EUR|GBP|ZAR|NGN|USh|\$|£|€)$", RegexOptions.IgnoreCase)) continue;
+                if (Regex.IsMatch(tokens[j], @"^[\.,]$")) continue;
+                // Any other word/text means it's meaningful: don't truncate
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // ORIGINAL method (left for reference; not used for balance anymore)
+    private static bool TryFindRightmostMoney(List<string> tokens, out int index, out decimal value)
+    {
+        for (int i = tokens.Count - 1; i >= 0; i--)
+        {
+            if (MoneyTokenRx.IsMatch(tokens[i]) && TryParseMoneyUniversal(tokens[i], out var v, out _, out _))
+            {
+                index = i; value = v; return true;
+            }
+        }
+        index = -1; value = default;
+        return false;
+    }
+
+    // NEW: Hardened rightmost balance finder that rejects word–number–word (address-like) integers
+    private static bool TryFindRightmostBalance(List<string> tokens, out int index, out decimal value)
+    {
+        for (int i = tokens.Count - 1; i >= 0; i--)
+        {
+            var s = tokens[i];
+            if (!MoneyTokenRx.IsMatch(s)) continue;
+            if (!TryParseMoneyUniversal(s, out var v, out _, out _)) continue;
+            if (!IsPlausibleBalanceToken(tokens, i, s, v)) continue;
+
+            index = i; value = v; return true;
+        }
+        index = -1; value = default;
+        return false;
+    }
+
+    private static bool IsPlausibleBalanceToken(List<string> tokens, int idx, string token, decimal parsed)
+    {
+        // Currency or CR/DR or decimal places => plausibly a money figure
+        bool hasCurrency = Regex.IsMatch(token, @"(UGX|TZS|KES|USD|EUR|GBP|ZAR|NGN|USh|\$|£|€)", RegexOptions.IgnoreCase);
+        bool hasCrDr = Regex.IsMatch(token, @"\b(CR|DR)\b", RegexOptions.IgnoreCase);
+        bool hasTwoDec = Regex.IsMatch(token, @"[.,]\d{2}$");
+
+        var digitsOnly = Regex.Replace(token, @"[^\d]", "");
+        int len = digitsOnly.Length;
+
+        // Reject small/short integers in word-number-word context (typical address "Plot 17 Road")
+        string prev = (idx > 0) ? tokens[idx - 1] : "";
+        string next = (idx < tokens.Count - 1) ? tokens[idx + 1] : "";
+
+        bool prevIsWord = Regex.IsMatch(prev, @"^[A-Za-z]+$");
+        bool nextIsWord = Regex.IsMatch(next, @"^[A-Za-z]+$");
+
+        if (!hasCurrency && !hasCrDr && !hasTwoDec && len <= 2 && prevIsWord && nextIsWord)
+            return false;
+
+        // Extra strictness (helps with 3–4 digit street numbers)
+        if (!hasCurrency && !hasCrDr && !hasTwoDec && len <= 4 && prevIsWord && nextIsWord)
+            return false;
+
+        return true;
+    }
+
+    private static bool TryFindPrecedingAmount(List<string> tokens, int start, int end, out decimal amount, out bool hadCR, out bool hadDR)
+    {
+        for (int i = end - 1; i >= start; i--)
+        {
+            var s = tokens[i];
+            if (!MoneyTokenRx.IsMatch(s)) continue;
+            if (TryParseMoneyUniversal(s, out var a, out var cr, out var dr))
+            {
+                amount = a; hadCR = cr; hadDR = dr; return true;
+            }
+        }
+        amount = default; hadCR = false; hadDR = false;
+        return false;
+    }
+
+    private static bool IsMostlyDescendingByDate(List<Row> rows)
+    {
+        if (rows.Count < 3) return false;
+        int desc = 0, comps = 0;
+
+        for (int i = 1; i < rows.Count; i++)
+        {
+            var prev = rows[i - 1];
+            var cur = rows[i];
+
+            int cmp = prev.ValueDate.CompareTo(cur.ValueDate);
+            if (cmp == 0)
+            {
+                var prevT = prev.TransactionDate ?? prev.ValueDate;
+                var curT = cur.TransactionDate ?? cur.ValueDate;
+                cmp = prevT.CompareTo(curT);
+            }
+
+            if (cmp > 0) desc++; // previous is later than current
+            comps++;
+        }
+
+        // >60% descending means treat as descending
+        return comps > 0 && ((decimal)desc / comps) >= 0.6m;
+    }
+
+    private static List<Row> SortChronologicallyAscending(List<Row> rows)
+    {
+        // Stable sort: ValueDate asc, then TransactionDate asc, then original index
+        return rows
+            .Select((r, i) => (r, i))
+            .OrderBy(x => x.r.ValueDate)
+            .ThenBy(x => x.r.TransactionDate ?? x.r.ValueDate)
+            .ThenBy(x => x.i)
+            .Select(x => x.r)
+            .ToList();
+    }
+
+    private static bool IsDateToken(string s) => DateTokenRx.IsMatch(s);
+
+    private static bool TryParseDate(string s, out DateTime dt)
+    {
+        s = (s ?? string.Empty).Trim();
+        // Try with multiple cultures to pick month names if present
+        var cultures = new[] { CultureInfo.InvariantCulture, new CultureInfo("en-GB"), new CultureInfo("en-US") };
+        foreach (var ci in cultures)
+        {
+            if (DateTime.TryParseExact(s, DateFormats, ci, DateTimeStyles.AllowWhiteSpaces, out dt))
+                return true;
+        }
+        dt = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Universal money parser that handles:
+    ///  - (123) negative; leading -; CR/DR suffix
+    ///  - thousand separators: ',', '.', space
+    ///  - decimal separator: '.' or ','
+    ///  - trailing currency codes/symbols
+    ///  - FIX: preserves leading '-' even when there is no decimal separator.
+    /// </summary>
+    private static bool TryParseMoneyUniversal(string token, out decimal value, out bool hadCR, out bool hadDR)
+    {
+        value = 0m; hadCR = false; hadDR = false;
+        if (string.IsNullOrWhiteSpace(token)) return false;
+
+        var s = token.Trim().Replace("\u00A0", " "); // strip NBSP
+        s = Regex.Replace(s, @"\s+", " ");
+
+        // Detect CR/DR at end
+        var mCrDr = Regex.Match(s, @"\s*(CR|DR)\s*$", RegexOptions.IgnoreCase);
+        if (mCrDr.Success)
+        {
+            hadCR = mCrDr.Groups[1].Value.Equals("CR", StringComparison.OrdinalIgnoreCase);
+            hadDR = mCrDr.Groups[1].Value.Equals("DR", StringComparison.OrdinalIgnoreCase);
+            s = s[..mCrDr.Index].TrimEnd();
+        }
+
+        // Detect parentheses for negatives
+        bool neg = s.StartsWith("(") && s.EndsWith(")");
+        s = s.Trim('(', ')');
+
+        // Capture leading explicit sign (do NOT remove it yet).
+        bool hadLeadingMinus = s.StartsWith("-");
+        bool hadLeadingPlus = s.StartsWith("+");
+
+        // Remove leading/trailing currency codes/symbols (basic)
+        s = Regex.Replace(s, @"^\s*(UGX|TZS|KES|USD|EUR|GBP|ZAR|NGN|USh|\$|£|€)\s*", "", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"\s*(UGX|TZS|KES|USD|EUR|GBP|ZAR|NGN|USh)$", "", RegexOptions.IgnoreCase);
+
+        s = s.Trim();
+
+        // If there's a trailing punctuation like '.' or ',' from OCR, strip it
+        s = Regex.Replace(s, @"[.,]$", "");
+
+        // Decide decimal separator by last dot/comma having 2 digits after it; strip other group seps
+        char? decSep = null;
+        int lastDot = s.LastIndexOf('.');
+        int lastComma = s.LastIndexOf(',');
+
+        bool IsTwoDigitTail(int idx) => idx >= 0 && idx < s.Length - 1 && (s.Length - idx - 1) == 2 && char.IsDigit(s[idx + 1]) && char.IsDigit(s[idx + 2]);
+
+        if (IsTwoDigitTail(lastDot) && !IsTwoDigitTail(lastComma))
+            decSep = '.';
+        else if (IsTwoDigitTail(lastComma) && !IsTwoDigitTail(lastDot))
+            decSep = ',';
+        else if (IsTwoDigitTail(lastDot) && IsTwoDigitTail(lastComma))
+            decSep = (lastDot > lastComma) ? '.' : ','; // whichever is last
+        else
+            decSep = null;
+
+        if (decSep == null)
+        {
+            // No clear decimal separator: strip non-digits BUT keep the sign we captured.
+            string digitsOnly = Regex.Replace(s, @"[^\d]", "");
+            if (string.IsNullOrEmpty(digitsOnly)) return false;
+            if (!decimal.TryParse(digitsOnly, NumberStyles.None, CultureInfo.InvariantCulture, out value))
+                return false;
+
+            if (hadLeadingMinus) value = -value; // preserve leading minus for integer-like tokens
+        }
+        else
+        {
+            // Keep the chosen decimal separator; remove other seps/spaces, preserve leading sign
+            string patternToRemove = (decSep == '.') ? @"[,\s]" : @"[.\s]";
+            string normalized = Regex.Replace(s, patternToRemove, "");
+            if (decSep == ',') normalized = normalized.Replace(',', '.'); // convert to dot decimal
+
+            if (!decimal.TryParse(normalized, NumberStyles.AllowDecimalPoint | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value))
+                return false;
+        }
+
+        if (neg) value = -value; // parentheses negative
+        // If CR/DR was present, direction may be implied, but numeric sign stays as parsed; delta decides.
+        return true;
+    }
+
+    private static string CutLine(string l)
+    {
+        foreach (var m in CutMarkers)
+        {
+            var idx = l.IndexOf(m, StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0)
+                return l[..idx];
+        }
+        return l;
+    }
+
+    private static string Normalize(string t)
+    {
+        if (t == null) return string.Empty;
+        // unify newlines and collapse empty lines
+        var s = t.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\u00A0", " ");
+        s = Regex.Replace(s, @"\n{2,}", "\n");
+        return s.Trim();
+    }
+
+    private static string HardCutAfterClosingBalance(string t)
+    {
+        var sb = new StringBuilder();
+        var lines = t.Split('\n');
+        var closeRegex = new Regex(@"^\s*Closing Balance\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        bool cut = false;
+
+        foreach (var l in lines)
+        {
+            sb.AppendLine(l);
+            if (closeRegex.IsMatch(l))
+            {
+                cut = true;
+                break;
+            }
+        }
+        return cut ? sb.ToString() : t;
+    }
+
+    private static List<string> Split(string s) =>
+        Regex.Split(s ?? "", @"\s+").Where(x => x.Length > 0).ToList();
+}
