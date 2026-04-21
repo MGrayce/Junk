@@ -1,0 +1,325 @@
+        public static ExtractionResult2 ExtractAfterAnalysis(PdfAnalysisResult analysis, string pdfPath)
+        {
+            switch (analysis.Engine)
+            {
+                case ExtractionEngine.PdfText:
+                    return ExtractWithPdfText(pdfPath);
+
+                case ExtractionEngine.Tesseract:
+                    {
+                        using var ocrEngine = CreateOcr();
+                        return ExtractWithTesseract(pdfPath, ocrEngine);
+                    }
+
+
+                default:
+                    return new ExtractionResult2("", false, ExtractionEngine.Failed, 0);
+            }
+
+            static TesseractEngine CreateOcr()
+            {
+                var engine = new TesseractEngine(
+                    TessConfigs.data,
+                    "eng",
+                    EngineMode.TesseractAndLstm);
+
+                engine.DefaultPageSegMode = PageSegMode.Auto;
+                engine.SetVariable("user_defined_dpi", "300");
+                engine.SetVariable("tessedit_char_blacklist", "|{}~`");
+                engine.SetVariable("preserve_interword_spaces", "1");
+
+                engine.SetVariable("tessedit_char_whitelist",
+                    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,/-() ");
+                engine.SetVariable("textord_tabfind_vertical_text", "0");
+
+
+                return engine;
+            }
+        }
+
+        public static ExtractionResult2 ExtractWithTesseract(string pdfPath, TesseractEngine engine)
+        {
+            using var pdf = PdfDocument.Load(pdfPath);
+            var sb = new StringBuilder();
+            int successPages = 0;
+            float qualitySum = 0f;
+
+            for (int i = 0; i < pdf.PageCount; i++)
+            {
+                string bestText = string.Empty;
+                float bestScore = 0f;
+
+                // Multi-pass OCR improves accuracy for mixed scan qualities.
+                // Keep first pass for speed; fallback pass only if needed.
+                var dpiCandidates = new[] { 450, 550 };
+                for (int p = 0; p < dpiCandidates.Length; p++)
+                {
+                    using var bmp = RenderPdfPageToBitmap(pdfPath, i, dpiCandidates[p]);
+                    using var prep = PrepareForOcr(bmp);
+                    using var pix = BitmapToPix(prep);
+                    using var page = engine.Process(pix);
+
+                    string text = page.GetText() ?? string.Empty;
+                    float score = ScoreOcrText(text);
+
+                    if (score > bestScore || (score == bestScore && text.Length > bestText.Length))
+                    {
+                        bestScore = score;
+                        bestText = text;
+                    }
+
+                    // Early exit when already high quality.
+                    if (bestScore >= 0.92f)
+                        break;
+                }
+
+                if (bestText.Length > 50 || bestScore >= 0.35f)
+                    successPages++;
+
+                qualitySum += bestScore;
+                sb.AppendLine(bestText);
+            }
+
+            var pageCount = Math.Max(pdf.PageCount, 1);
+            float baseSuccess = (float)successPages / pageCount;
+            float avgQuality = qualitySum / pageCount;
+            float confidence = Math.Min(1f, (baseSuccess * 0.6f + avgQuality * 0.4f) * 0.95f);
+
+            return new ExtractionResult2(
+                sb.ToString(),
+                successPages > 0,
+                ExtractionEngine.Tesseract,
+                confidence
+            );
+        }
+        private static Bitmap RenderPdfPageToBitmap(string pdfPath, int pageIndex, int dpi = 500)
+        {
+            using var pdf = PdfiumViewer.PdfDocument.Load(pdfPath);
+
+            var pageSize = pdf.PageSizes[pageIndex]; // points (1/72 inch)
+            dpi = Math.Clamp(dpi, 300, 600);
+
+            int width = (int)(pageSize.Width / 72.0 * dpi);
+            int height = (int)(pageSize.Height / 72.0 * dpi);
+
+            using var image = pdf.Render(
+                pageIndex,
+                width,
+                height,
+                dpi,
+                dpi,
+                PdfRenderFlags.ForPrinting |
+                PdfRenderFlags.NoNativeText |
+                PdfRenderFlags.LcdText
+            );
+
+            var bmp = new Bitmap(image);
+            bmp.SetResolution(dpi, dpi);
+            return bmp;
+        }
+        public static Bitmap PrepareForOcr(Bitmap src)
+        {
+            Bitmap working = src;
+
+            // Upscale very small source images for better OCR character shape recovery.
+            if (src.Width < 1600)
+            {
+                int targetWidth = (int)(src.Width * 1.5);
+                int targetHeight = (int)(src.Height * 1.5);
+                var upscaled = new Bitmap(targetWidth, targetHeight, PixelFormat.Format24bppRgb);
+                using (var ug = Graphics.FromImage(upscaled))
+                {
+                    ug.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    ug.DrawImage(src, new Rectangle(0, 0, targetWidth, targetHeight));
+                }
+                working = upscaled;
+            }
+
+            var gray = new Bitmap(working.Width, working.Height, PixelFormat.Format24bppRgb);
+
+            using var g = Graphics.FromImage(gray);
+            var cm = new ColorMatrix(new[]
+            {
+                new float[] {0.299f, 0.299f, 0.299f, 0, 0},
+                new float[] {0.587f, 0.587f, 0.587f, 0, 0},
+                new float[] {0.114f, 0.114f, 0.114f, 0, 0},
+                new float[] {0,      0,      0,      1, 0},
+                new float[] {0,      0,      0,      0, 1}
+            });
+
+            // Slight contrast boost helps OCR separate text from noisy backgrounds.
+            const float contrast = 1.22f;
+            var translated = 0.5f * (1f - contrast);
+            var contrastMatrix = new ColorMatrix(new[]
+            {
+                new[] { contrast, 0f, 0f, 0f, 0f },
+                new[] { 0f, contrast, 0f, 0f, 0f },
+                new[] { 0f, 0f, contrast, 0f, 0f },
+                new[] { 0f, 0f, 0f, 1f, 0f },
+                new[] { translated, translated, translated, 0f, 1f }
+            });
+            cm = MultiplyColorMatrices(cm, contrastMatrix);
+
+            using var ia = new ImageAttributes();
+            ia.SetColorMatrix(cm);
+
+            g.DrawImage(working,
+                new Rectangle(0, 0, gray.Width, gray.Height),
+                0, 0, working.Width, working.Height,
+                GraphicsUnit.Pixel,
+                ia);
+
+            BinarizeInPlace(gray);
+
+            if (!ReferenceEquals(working, src))
+                working.Dispose();
+
+            return gray;
+        }
+
+        private static Pix BitmapToPix(Bitmap bitmap)
+        {
+            using var ms = new MemoryStream();
+            bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Bmp);
+            ms.Position = 0;
+            return Pix.LoadFromMemory(ms.ToArray());
+        }
+
+        private static float ScoreOcrText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return 0f;
+
+            var lengthScore = Math.Min(1f, text.Length / 1200f);
+            var dateHits = System.Text.RegularExpressions.Regex.Matches(
+                text,
+                @"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\b").Count;
+            var amountHits = System.Text.RegularExpressions.Regex.Matches(
+                text,
+                @"\b\d{1,3}(?:,\d{3})*(?:\.\d{2})\b").Count;
+
+            var structureScore = Math.Min(1f, (dateHits * 0.18f) + (amountHits * 0.08f));
+            return Math.Clamp(lengthScore * 0.5f + structureScore * 0.5f, 0f, 1f);
+        }
+
+        private static ColorMatrix MultiplyColorMatrices(ColorMatrix a, ColorMatrix b)
+        {
+            float[][] left =
+            {
+                new[] { a.Matrix00, a.Matrix01, a.Matrix02, a.Matrix03, a.Matrix04 },
+                new[] { a.Matrix10, a.Matrix11, a.Matrix12, a.Matrix13, a.Matrix14 },
+                new[] { a.Matrix20, a.Matrix21, a.Matrix22, a.Matrix23, a.Matrix24 },
+                new[] { a.Matrix30, a.Matrix31, a.Matrix32, a.Matrix33, a.Matrix34 },
+                new[] { a.Matrix40, a.Matrix41, a.Matrix42, a.Matrix43, a.Matrix44 }
+            };
+
+            float[][] right =
+            {
+                new[] { b.Matrix00, b.Matrix01, b.Matrix02, b.Matrix03, b.Matrix04 },
+                new[] { b.Matrix10, b.Matrix11, b.Matrix12, b.Matrix13, b.Matrix14 },
+                new[] { b.Matrix20, b.Matrix21, b.Matrix22, b.Matrix23, b.Matrix24 },
+                new[] { b.Matrix30, b.Matrix31, b.Matrix32, b.Matrix33, b.Matrix34 },
+                new[] { b.Matrix40, b.Matrix41, b.Matrix42, b.Matrix43, b.Matrix44 }
+            };
+
+            float Dot(int r, int c) =>
+                left[r][0] * right[0][c] +
+                left[r][1] * right[1][c] +
+                left[r][2] * right[2][c] +
+                left[r][3] * right[3][c] +
+                left[r][4] * right[4][c];
+
+            return new ColorMatrix(new[]
+            {
+                new[] { Dot(0,0), Dot(0,1), Dot(0,2), Dot(0,3), Dot(0,4) },
+                new[] { Dot(1,0), Dot(1,1), Dot(1,2), Dot(1,3), Dot(1,4) },
+                new[] { Dot(2,0), Dot(2,1), Dot(2,2), Dot(2,3), Dot(2,4) },
+                new[] { Dot(3,0), Dot(3,1), Dot(3,2), Dot(3,3), Dot(3,4) },
+                new[] { Dot(4,0), Dot(4,1), Dot(4,2), Dot(4,3), Dot(4,4) }
+            });
+        }
+
+        private static void BinarizeInPlace(Bitmap bitmap)
+        {
+            var rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            var data = bitmap.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format24bppRgb);
+
+            try
+            {
+                int stride = data.Stride;
+                int totalBytes = stride * bitmap.Height;
+                var buffer = new byte[totalBytes];
+                System.Runtime.InteropServices.Marshal.Copy(data.Scan0, buffer, 0, totalBytes);
+
+                var histogram = new int[256];
+                for (int y = 0; y < bitmap.Height; y++)
+                {
+                    int row = y * stride;
+                    for (int x = 0; x < bitmap.Width; x++)
+                    {
+                        int idx = row + (x * 3);
+                        // Already grayscale, so any channel is fine.
+                        histogram[buffer[idx]]++;
+                    }
+                }
+
+                int threshold = ComputeOtsuThreshold(histogram, bitmap.Width * bitmap.Height);
+
+                for (int y = 0; y < bitmap.Height; y++)
+                {
+                    int row = y * stride;
+                    for (int x = 0; x < bitmap.Width; x++)
+                    {
+                        int idx = row + (x * 3);
+                        byte v = (buffer[idx] >= threshold) ? (byte)255 : (byte)0;
+                        buffer[idx] = v;
+                        buffer[idx + 1] = v;
+                        buffer[idx + 2] = v;
+                    }
+                }
+
+                System.Runtime.InteropServices.Marshal.Copy(buffer, 0, data.Scan0, totalBytes);
+            }
+            finally
+            {
+                bitmap.UnlockBits(data);
+            }
+        }
+
+        private static int ComputeOtsuThreshold(int[] histogram, int totalPixels)
+        {
+            double sum = 0;
+            for (int t = 0; t < 256; t++)
+                sum += t * histogram[t];
+
+            double sumBackground = 0;
+            int weightBackground = 0;
+            int weightForeground;
+
+            double maxVariance = 0;
+            int threshold = 128;
+
+            for (int t = 0; t < 256; t++)
+            {
+                weightBackground += histogram[t];
+                if (weightBackground == 0) continue;
+
+                weightForeground = totalPixels - weightBackground;
+                if (weightForeground == 0) break;
+
+                sumBackground += t * histogram[t];
+                double meanBackground = sumBackground / weightBackground;
+                double meanForeground = (sum - sumBackground) / weightForeground;
+
+                double betweenClassVariance = weightBackground * weightForeground *
+                                              (meanBackground - meanForeground) * (meanBackground - meanForeground);
+
+                if (betweenClassVariance > maxVariance)
+                {
+                    maxVariance = betweenClassVariance;
+                    threshold = t;
+                }
+            }
+
+            return threshold;
+        }
